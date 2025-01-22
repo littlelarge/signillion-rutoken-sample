@@ -1,0 +1,439 @@
+Subject: [PATCH] Fix getting PKCS#11 slots
+---
+Index: android/app/src/main/kotlin/com/example/rutoken_sample/MainActivity.kt
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/android/app/src/main/kotlin/com/example/rutoken_sample/MainActivity.kt b/android/app/src/main/kotlin/com/example/rutoken_sample/MainActivity.kt
+--- a/android/app/src/main/kotlin/com/example/rutoken_sample/MainActivity.kt	(revision b75a81985d162732a7d6f284d021ba1f1e428707)
++++ b/android/app/src/main/kotlin/com/example/rutoken_sample/MainActivity.kt	(date 1737386950317)
+@@ -1,18 +1,16 @@
+ package com.example.rutoken_sample
+ 
+ import android.app.AlertDialog
+-import android.content.BroadcastReceiver
+-import android.content.Context
+-import android.content.Intent
+-import android.content.IntentFilter
+-import android.hardware.usb.UsbDevice
+-import android.hardware.usb.UsbManager
+ import android.os.Bundle
+-import androidx.core.app.OnNewIntentProvider
+ import com.sun.jna.Native
++import io.flutter.Log
+ import io.flutter.embedding.android.FlutterFragmentActivity
+ import io.flutter.embedding.engine.FlutterEngine
+ import io.flutter.plugins.GeneratedPluginRegistrant
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.GlobalScope
++import kotlinx.coroutines.isActive
++import kotlinx.coroutines.launch
+ import org.bouncycastle.asn1.ASN1BitString
+ import org.bouncycastle.asn1.ASN1OctetString
+ import org.bouncycastle.asn1.ASN1Sequence
+@@ -29,7 +27,6 @@
+ import ru.rutoken.pkcs11jna.Pkcs11Constants.CK_CERTIFICATE_CATEGORY_TOKEN_USER
+ import ru.rutoken.pkcs11wrapper.attribute.IPkcs11AttributeFactory
+ import ru.rutoken.pkcs11wrapper.attribute.Pkcs11Attribute
+-import ru.rutoken.pkcs11wrapper.constant.IPkcs11MechanismType
+ import ru.rutoken.pkcs11wrapper.constant.standard.Pkcs11AttributeType
+ import ru.rutoken.pkcs11wrapper.constant.standard.Pkcs11MechanismType
+ import ru.rutoken.pkcs11wrapper.constant.standard.Pkcs11ObjectClass
+@@ -40,7 +37,9 @@
+ import ru.rutoken.pkcs11wrapper.lowlevel.jna.Pkcs11JnaLowLevelFactory
+ import ru.rutoken.pkcs11wrapper.main.Pkcs11Api
+ import ru.rutoken.pkcs11wrapper.main.Pkcs11BaseModule
++import ru.rutoken.pkcs11wrapper.main.Pkcs11Exception
+ import ru.rutoken.pkcs11wrapper.main.Pkcs11Session
++import ru.rutoken.pkcs11wrapper.main.Pkcs11Token
+ import ru.rutoken.pkcs11wrapper.mechanism.Pkcs11Mechanism
+ import ru.rutoken.pkcs11wrapper.mechanism.parameter.CkRsaPkcsPssParams
+ import ru.rutoken.pkcs11wrapper.`object`.Pkcs11StorageObject
+@@ -56,8 +55,7 @@
+ import java.security.interfaces.RSAPublicKey
+ 
+ 
+-class MainActivity : FlutterFragmentActivity(), OnNewIntentProvider,
+-    RtTransport.PcscReaderObserver {
++class MainActivity : FlutterFragmentActivity() {
+     // Data to sign
+     private val DATA_TO_SIGN = byteArrayOf(0x01.toByte(), 0x02.toByte(), 0x03.toByte())
+ 
+@@ -77,153 +75,192 @@
+ 
+     val RSA_KEY_PAIR_ID: ByteArray = "Sample RSA key pair".toByteArray()
+ 
++    private val TAG = this::class.qualifiedName.toString()
++
++    private val module = Module()
++
++    private val pcscReaderObserver = object : RtTransport.PcscReaderObserver {
++        override fun onReaderAdded(reader: RtTransport.PcscReader) {
++            showAlertDialog(
++                "Reader ${reader.name} Connected",
++                "A PC/SC reader has been connected."
++            )
++        }
++
++        override fun onReaderRemoved(reader: RtTransport.PcscReader) {
++            showAlertDialog(
++                "Reader ${reader.name} Disconnected",
++                "The PC/SC reader device has been removed."
++            )
++        }
++    }
++
+     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+         super.configureFlutterEngine(flutterEngine)
+         GeneratedPluginRegistrant.registerWith(flutterEngine)
+     }
+ 
+-    private val usbReceiver = object : BroadcastReceiver() {
+-        override fun onReceive(context: Context?, intent: Intent?) {
+-            when (intent?.action) {
+-                UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+-                    val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
+-                    device?.let {
+-                        handleModule()
+-
+-                        showUsbDialog("New device!", "Device connected: ${it.deviceName}")
+-                        // Handle device connected
+-                    }
+-                }
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
+ 
+-                UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+-                    val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
+-                    device?.let {
++        System.setProperty("jna.nosys", "true")
+ 
+-                        showUsbDialog("Disconnected!", "Device disconnected: ${it.deviceName}")
+-                        // Handle device disconnected
+-                    }
+-                }
+-            }
+-        }
++        // Add PC/SC readers observer to RtTransport
++        RtPcscBridge.getTransport().addPcscReaderObserver(pcscReaderObserver)
+     }
+ 
+-    fun handleModule() {
+-        val module = Module()
++    override fun onStart() {
++        super.onStart()
+         try {
+-            module.initializeModule(
+-                Pkcs11InitializeArgs.Builder().setOsLockingOk(true).build()
+-            )
++            /*
++             * Create a coroutine that will call the Pkcs11Module#waitForSlotEvent method.
++             *
++             * WARNING: We use GlobalScope for simplicity and strongly recommend against using it in
++             * production code
++             */
++            GlobalScope.launch(Dispatchers.IO) {
++                // Pkcs11Module#waitForSlotEvent needs initialized module
++                module.initializeModule(Pkcs11InitializeArgs.Builder().setOsLockingOk(true).build())
+ 
+-            val slots = module.getSlotList(true)
++                while (isActive) {
++                    try {
++                        val slot = module.waitForSlotEvent(false)
++                        if (slot?.slotInfo?.isTokenPresent == true) {
++                            handleSlotFromWaitForSlotEvent(slot.token)
++                            // Break the loop when a slot with a present token is found
++                            break
++                        }
++                    } catch (e: Pkcs11Exception) {
++                        Log.e(TAG, "Error while waiting for slot event", e)
++                    }
++                }
++            }
++        } catch (e: Exception) {
++            Log.e(TAG, "Failed to initialize rtpkcs11ecp.", e)
++        }
++    }
+ 
+-            if (slots.isNotEmpty()) {
+-                val firstSlot = slots[0]
++    override fun onStop() {
++        super.onStop()
++        try {
++            if (!isChangingConfigurations) {
++                /*
++                 * WARNING: We use GlobalScope for simplicity and strongly recommend against using
++                 * it in production code
++                 */
++                GlobalScope.launch(Dispatchers.IO) {
++                    module.finalizeModule()
++                }
++            }
++        } catch (e: Exception) {
++            Log.e(TAG, "Failed to finalize rtpkcs11ecp.", e)
++        }
++    }
+ 
+-                try {
+-                    val session = firstSlot.token.openSession(true)
+-                    var signMechanismType: IPkcs11MechanismType
+-                    var digestMechanismType: IPkcs11MechanismType? = null
++    // Will be called when Pkcs11Module#waitForSlotEvent returns the slot with the present token
++    private fun handleSlotFromWaitForSlotEvent(token: Pkcs11Token) {
++        try {
++            doPkcs11Operation(token)
++        } catch (e: Exception) {
++            Log.e(TAG, "Failed to handle slot from wait for slot event.", e)
++        }
++    }
+ 
+-                    digestMechanismType = Pkcs11MechanismType.CKM_RSA_PKCS_KEY_PAIR_GEN
+-                    signMechanismType = Pkcs11MechanismType.CKM_SHA256_RSA_PKCS
+-
+-                    try {
+-                        session.login(Pkcs11UserType.CKU_USER, "12345678").use {
+-                            println("Finding signer certificate")
+-                            val signerCertificate = findCertificateById(session, RSA_KEY_PAIR_ID)
+-                            val signerCertificateValue =
+-                                signerCertificate.getByteArrayAttributeValue(
+-                                    session,
+-                                    Pkcs11AttributeType.CKA_VALUE
+-                                ).byteArrayValue
++    /*
++     * Should be called ONLY if guaranteed that the token is already connected and all permissions
++     * is granted. Otherwise, Pkcs11Module#getSlotList returns an empty list
++     */
++    private fun handleSlotFromGetSlotList() {
++        try {
++            val slots = module.getSlotList(true)
++            if (slots.isNotEmpty())
++                doPkcs11Operation(slots.first().token)
++        } catch (e: Exception) {
++            Log.e(TAG, "Failed to handle slot from get slot list.", e)
++        }
++    }
++
++    private fun doPkcs11Operation(token: Pkcs11Token) {
++        val signMechanismType = Pkcs11MechanismType.CKM_SHA256_RSA_PKCS
++        val digestMechanismType = Pkcs11MechanismType.CKM_RSA_PKCS_KEY_PAIR_GEN
++        token.openSession(true).use { session ->
++            session.login(Pkcs11UserType.CKU_USER, "12345678").use {
++                println("Finding signer certificate")
++                val signerCertificate = findCertificateById(session, RSA_KEY_PAIR_ID)
++                val signerCertificateValue =
++                    signerCertificate.getByteArrayAttributeValue(
++                        session,
++                        Pkcs11AttributeType.CKA_VALUE
++                    ).byteArrayValue
+ 
+-                            val keyPair =
+-                                findKeyPairByCertificateValue(session, signerCertificateValue)
++                val keyPair =
++                    findKeyPairByCertificateValue(session, signerCertificateValue)
+ 
+-                            val signMechanism: Pkcs11Mechanism
+-                            var dataToSign = DATA_TO_SIGN
++                val signMechanism: Pkcs11Mechanism
++                var dataToSign = DATA_TO_SIGN
+ 
+-                            if (SIGN_WITH_DIGEST) {
+-                                signMechanism = if (USE_PSS_PADDING) {
+-                                    Pkcs11Mechanism.make(
+-                                        signMechanismType,
+-                                        CkRsaPkcsPssParams(
+-                                            CKM_SHA256.toLong(),
+-                                            CKG_MGF1_SHA256.toLong(),
+-                                            0
+-                                        )
+-                                    )
+-                                } else {
+-                                    Pkcs11Mechanism.make(signMechanismType)
+-                                }
+-                            } else {
+-                                val digest = session.digestManager.digestAtOnce(
+-                                    DATA_TO_SIGN,
+-                                    Pkcs11Mechanism.make(digestMechanismType)
+-                                )
++                if (SIGN_WITH_DIGEST) {
++                    signMechanism = if (USE_PSS_PADDING) {
++                        Pkcs11Mechanism.make(
++                            signMechanismType,
++                            CkRsaPkcsPssParams(
++                                CKM_SHA256.toLong(),
++                                CKG_MGF1_SHA256.toLong(),
++                                0
++                            )
++                        )
++                    } else {
++                        Pkcs11Mechanism.make(signMechanismType)
++                    }
++                } else {
++                    val digest = session.digestManager.digestAtOnce(
++                        DATA_TO_SIGN,
++                        Pkcs11Mechanism.make(digestMechanismType)
++                    )
+ 
+-                                signMechanism = if (USE_PSS_PADDING) {
+-                                    dataToSign = digest
+-                                    Pkcs11Mechanism.make(
+-                                        signMechanismType,
+-                                        CkRsaPkcsPssParams(
+-                                            CKM_SHA256.toLong(),
+-                                            CKG_MGF1_SHA256.toLong(),
+-                                            digest.size.toLong()
+-                                        )
+-                                    )
+-                                } else {
+-                                    val digestInfo = DigestInfo(
+-                                        AlgorithmIdentifier(
+-                                            NISTObjectIdentifiers.id_sha256,
+-                                            DERNull.INSTANCE
+-                                        ), digest
+-                                    )
+-                                    dataToSign = digestInfo.encoded
+-                                    Pkcs11Mechanism.make(signMechanismType)
+-                                }
+-                            }
++                    signMechanism = if (USE_PSS_PADDING) {
++                        dataToSign = digest
++                        Pkcs11Mechanism.make(
++                            signMechanismType,
++                            CkRsaPkcsPssParams(
++                                CKM_SHA256.toLong(),
++                                CKG_MGF1_SHA256.toLong(),
++                                digest.size.toLong()
++                            )
++                        )
++                    } else {
++                        val digestInfo = DigestInfo(
++                            AlgorithmIdentifier(
++                                NISTObjectIdentifiers.id_sha256,
++                                DERNull.INSTANCE
++                            ), digest
++                        )
++                        dataToSign = digestInfo.encoded
++                        Pkcs11Mechanism.make(signMechanismType)
++                    }
++                }
+ 
+-                            val signature = session.signManager.signAtOnce(
+-                                dataToSign,
+-                                signMechanism,
+-                                keyPair.privateKey
+-                            )
+-                            showUsbDialog("Successfully signed", signature.toString())
++                val signature = session.signManager.signAtOnce(
++                    dataToSign,
++                    signMechanism,
++                    keyPair.privateKey
++                )
++                showAlertDialog("Successfully signed", signature.toString())
+ 
+-                            println("Verifying RSA signature")
+-                            val result = session.verifyManager.verifyAtOnce(
+-                                dataToSign,
+-                                signature,
+-                                signMechanism,
+-                                keyPair.publicKey
+-                            )
++                println("Verifying RSA signature")
++                val result = session.verifyManager.verifyAtOnce(
++                    dataToSign,
++                    signature,
++                    signMechanism,
++                    keyPair.publicKey
++                )
+ 
+-                            if (result) {
+-                                println("RSA signature is valid")
+-                            } else {
+-                                throw IllegalStateException("RSA signature is invalid")
+-                            }
+-                        }
+-                    } catch (e: Exception) {
+-                        showUsbDialog("Error occurred", e.toString())
+-                    } finally {
+-                        module.finalizeModule()
+-                    }
+-                } catch (e: Exception) {
+-                    showUsbDialog("Error occurred while getting first token", e.toString())
++                if (result) {
++                    println("RSA signature is valid")
++                } else {
++                    throw IllegalStateException("RSA signature is invalid")
+                 }
+-
+-
+-                showUsbDialog(
+-                    "Slot found!",
+-                    "Slot with present token found!" + firstSlot.token.toString()
+-                )
+-            } else {
+-                showUsbDialog("Slot not found!", "No slot with present token found!")
+             }
+-        } finally {
+-            module.finalizeModule()
+         }
+     }
+ 
+@@ -369,16 +406,7 @@
+         }
+     }
+ 
+-
+-    override fun onNewIntent(intent: Intent) {
+-        super.onNewIntent(intent)
+-        intent?.let {
+-            RtPcscBridge.getTransport()?.handleNfcIntent(it)
+-        }
+-    }
+-
+-
+-    private fun showUsbDialog(title: String, message: String) {
++    private fun showAlertDialog(title: String, message: String) {
+         AlertDialog.Builder(this)
+             .setTitle(title)
+             .setMessage(message)
+@@ -386,41 +414,4 @@
+             .create()
+             .show()
+     }
+-
+-
+-    override fun onReaderAdded(reader: RtTransport.PcscReader) {
+-        reader.toString()
+-        showUsbDialog(
+-            "USB Connected",
+-            "A USB device has been connected."
+-        )
+-    }
+-
+-    override fun onReaderRemoved(reader: RtTransport.PcscReader) {
+-        reader.toString()
+-        showUsbDialog(
+-            "USB Disconnected",
+-            "The USB device has been removed."
+-        )
+-    }
+-
+-    override fun onCreate(savedInstanceState: Bundle?) {
+-        super.onCreate(savedInstanceState)
+-
+-        System.setProperty("jna.nosys", "true")
+-
+-        val filter = IntentFilter().apply {
+-            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+-            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+-        }
+-        registerReceiver(usbReceiver, filter)
+-
+-        handleModule()
+-    }
+-
+-    override fun onDestroy() {
+-        super.onDestroy()
+-
+-        unregisterReceiver(usbReceiver)
+-    }
+ }
