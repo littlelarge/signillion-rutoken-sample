@@ -3,7 +3,14 @@ allprojects {
         google()
         mavenCentral()
     }
+
+    buildscript {
+        dependencies {
+            classpath 'com.android.tools.build:gradle:8.1.0'
+        }
+    }
 }
+
 
 rootProject.buildDir = "../build"
 subprojects {

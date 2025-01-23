@@ -5,7 +5,7 @@ import ru.rutoken.rttransport.RtTransport
 class ReaderObserver(private val activity: MainActivity) : RtTransport.PcscReaderObserver {
     override fun onReaderAdded(reader: RtTransport.PcscReader) {
         activity.showUsbDialog("Reader added: ${reader.name}", "")
-        activity.handlePkcsModule(0)
+        activity.handleSlotFromGetSlotList()
     }
 
     override fun onReaderRemoved(reader: RtTransport.PcscReader) {
