@@ -2,44 +2,33 @@ package com.example.rutoken_sample
 
 import android.app.AlertDialog
 import android.os.Bundle
-import io.flutter.Log
+import com.example.rutoken_sample.createobjects.GostKeyPairParams
 import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugins.GeneratedPluginRegistrant
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
-import org.bouncycastle.asn1.x509.DigestInfo
-import ru.rutoken.pkcs11jna.Pkcs11Constants.CKC_X_509
-import ru.rutoken.pkcs11jna.Pkcs11Constants.CKG_MGF1_SHA256
-import ru.rutoken.pkcs11jna.Pkcs11Constants.CKK_RSA
-import ru.rutoken.pkcs11jna.Pkcs11Constants.CKM_SHA256
-import ru.rutoken.pkcs11jna.Pkcs11Constants.CKO_CERTIFICATE
-import org.bouncycastle.asn1.x509.AlgorithmIdentifier
 import org.bouncycastle.asn1.ASN1BitString
 import org.bouncycastle.asn1.ASN1OctetString
 import org.bouncycastle.asn1.ASN1Sequence
-import org.bouncycastle.asn1.DERNull
-import org.bouncycastle.asn1.nist.NISTObjectIdentifiers
+import ru.rutoken.pkcs11jna.Pkcs11Constants.CKC_X_509
+import ru.rutoken.pkcs11jna.Pkcs11Constants.CKK_RSA
+import ru.rutoken.pkcs11jna.Pkcs11Constants.CKO_CERTIFICATE
 import ru.rutoken.pkcs11jna.Pkcs11Constants.CK_CERTIFICATE_CATEGORY_TOKEN_USER
 import ru.rutoken.pkcs11wrapper.attribute.IPkcs11AttributeFactory
 import ru.rutoken.pkcs11wrapper.attribute.Pkcs11Attribute
 import ru.rutoken.pkcs11wrapper.constant.standard.Pkcs11AttributeType
-import ru.rutoken.pkcs11wrapper.constant.standard.Pkcs11MechanismType
+import ru.rutoken.pkcs11wrapper.constant.standard.Pkcs11AttributeType.CKA_VALUE
 import ru.rutoken.pkcs11wrapper.constant.standard.Pkcs11ObjectClass
 import ru.rutoken.pkcs11wrapper.constant.standard.Pkcs11UserType
-import ru.rutoken.pkcs11wrapper.datatype.Pkcs11InitializeArgs
 import ru.rutoken.pkcs11wrapper.datatype.Pkcs11KeyPair
 import ru.rutoken.pkcs11wrapper.main.Pkcs11Exception
 import ru.rutoken.pkcs11wrapper.main.Pkcs11Session
 import ru.rutoken.pkcs11wrapper.main.Pkcs11Token
 import ru.rutoken.pkcs11wrapper.mechanism.Pkcs11Mechanism
-import ru.rutoken.pkcs11wrapper.mechanism.parameter.CkRsaPkcsPssParams
 import ru.rutoken.pkcs11wrapper.`object`.Pkcs11StorageObject
 import ru.rutoken.pkcs11wrapper.`object`.certificate.Pkcs11CertificateObject
 import ru.rutoken.pkcs11wrapper.`object`.key.Pkcs11PrivateKeyObject
 import ru.rutoken.pkcs11wrapper.`object`.key.Pkcs11PublicKeyObject
+import ru.rutoken.pkcs11wrapper.rutoken.main.RtPkcs11Token
 import ru.rutoken.rtpcscbridge.RtPcscBridge
 import java.io.ByteArrayInputStream
 import java.security.cert.CertificateException
@@ -48,26 +37,27 @@ import java.security.cert.X509Certificate
 import java.security.interfaces.RSAPublicKey
 
 class MainActivity : FlutterFragmentActivity() {
-    // Data to sign
-    private val DATA_TO_SIGN = byteArrayOf(0x01.toByte(), 0x02.toByte(), 0x03.toByte())
+    private val DATA_TO_SIGN =
+        "Hello Rutoken! This is simple sample of sign hash data".toByteArray(
+            Charsets.UTF_8
+        )
 
     /**
      * We will find certificate by its ID. Change this field to your certificate ID.
+     * Also change GOST key algorithm by setting field [GOST_KEY_PAIR_PARAMS]
      */
+    private val CERTIFICATE_ID = GostKeyPairParams.GOST_2001_256.id
+    private val GOST_KEY_PAIR_PARAMS = GostKeyPairParams.GOST_2001_256
 
     /**
      * Change this flag to false if you want to digest data by yourself.
      */
-    private val SIGN_WITH_DIGEST = true
 
     /**
-     * Change this flag to false if you want to use PKCS1 padding instead of PSS padding.
+     * Change this flag to true if you want to digest data on the CPU and not on the token.
+     * This flag is available if [SIGN_WITH_DIGEST] == false.
      */
-    private val USE_PSS_PADDING = true
-
-    val RSA_KEY_PAIR_ID: ByteArray = "Sample RSA key pair".toByteArray()
-
-    private val TAG = this::class.qualifiedName.toString()
+    private val USE_PROGRAM_HASH = false
 
     private val module = Module()
 
@@ -82,15 +72,17 @@ class MainActivity : FlutterFragmentActivity() {
         System.setProperty("jna.nosys", "true")
 
         initializeRtPcscBridge()
+
     }
 
     private fun initializeRtPcscBridge() {
         val transport = RtPcscBridge.getTransport()
+        transport.initialize(this)
         transport?.addPcscReaderObserver(ReaderObserver(this))
     }
 
     // Will be called when Pkcs11Module#waitForSlotEvent returns the slot with the present token
-    private fun handleSlotFromWaitForSlotEvent(token: Pkcs11Token) {
+    private fun handleSlotFromWaitForSlotEvent(token: RtPkcs11Token) {
         try {
             doPkcs11Operation(token)
         } catch (e: Exception) {
@@ -104,9 +96,9 @@ class MainActivity : FlutterFragmentActivity() {
      */
     fun handleSlotFromGetSlotList() {
         try {
-            val slots = module.getSlotList(true)
-            showUsbDialog("Slots size: ", slots.size.toString())
+            module.initializeModule(null) // resolved the error
 
+            val slots = module.getSlotList(true)
             if (slots.isNotEmpty())
                 doPkcs11Operation(slots.first().token)
         } catch (e: Exception) {
@@ -115,86 +107,86 @@ class MainActivity : FlutterFragmentActivity() {
     }
 
     private fun doPkcs11Operation(token: Pkcs11Token) {
-        val signMechanismType = Pkcs11MechanismType.CKM_SHA256_RSA_PKCS
-        val digestMechanismType = Pkcs11MechanismType.CKM_RSA_PKCS_KEY_PAIR_GEN
-        token.openSession(true).use { session ->
-            session.login(Pkcs11UserType.CKU_USER, "12345678").use {
-                println("Finding signer certificate")
-                val signerCertificate = findCertificateById(session, RSA_KEY_PAIR_ID)
-                val signerCertificateValue =
-                    signerCertificate.getByteArrayAttributeValue(
-                        session,
-                        Pkcs11AttributeType.CKA_VALUE
-                    ).byteArrayValue
 
-                val keyPair =
-                    findKeyPairByCertificateValue(session, signerCertificateValue)
+        try {
+            token.openSession(true).use { session ->
+                var signMechanism: Pkcs11Mechanism? = null
+                var digestMechanism: Pkcs11Mechanism? = null
+                when (GOST_KEY_PAIR_PARAMS) {
 
-                val signMechanism: Pkcs11Mechanism
-                var dataToSign = DATA_TO_SIGN
-
-                if (SIGN_WITH_DIGEST) {
-                    signMechanism = if (USE_PSS_PADDING) {
-                        Pkcs11Mechanism.make(
-                            signMechanismType,
-                            CkRsaPkcsPssParams(
-                                CKM_SHA256.toLong(),
-                                CKG_MGF1_SHA256.toLong(),
-                                0
-                            )
-                        )
-                    } else {
-                        Pkcs11Mechanism.make(signMechanismType)
-                    }
-                } else {
-                    val digest = session.digestManager.digestAtOnce(
-                        DATA_TO_SIGN,
-                        Pkcs11Mechanism.make(digestMechanismType)
-                    )
-
-                    signMechanism = if (USE_PSS_PADDING) {
-                        dataToSign = digest
-                        Pkcs11Mechanism.make(
-                            signMechanismType,
-                            CkRsaPkcsPssParams(
-                                CKM_SHA256.toLong(),
-                                CKG_MGF1_SHA256.toLong(),
-                                digest.size.toLong()
-                            )
-                        )
-                    } else {
-                        val digestInfo = DigestInfo(
-                            AlgorithmIdentifier(
-                                NISTObjectIdentifiers.id_sha256,
-                                DERNull.INSTANCE
-                            ), digest
-                        )
-                        dataToSign = digestInfo.encoded
-                        Pkcs11Mechanism.make(signMechanismType)
+                    GostKeyPairParams.GOST_2001_256 -> {
+                        signMechanism = Pkcs11Mechanism.make(token.mechanismList[23])
+                        digestMechanism = Pkcs11Mechanism.make(token.mechanismList[29])
                     }
                 }
 
-                val signature = session.signManager.signAtOnce(
-                    dataToSign,
-                    signMechanism,
-                    keyPair.privateKey
-                )
-                showUsbDialog("Successfully signed", signature.toString())
+                println("Механизм: ${signMechanism.mechanismType}")
 
-                println("Verifying RSA signature")
-                val result = session.verifyManager.verifyAtOnce(
-                    dataToSign,
-                    signature,
-                    signMechanism,
-                    keyPair.publicKey
-                )
+                try {
+                    session.login(Pkcs11UserType.CKU_USER, "214021").use {
+                        try {
+                            val allCertificates = session.objectManager.findObjectsAtOnce(
+                                Pkcs11CertificateObject::class.java,
+                                listOf(
+                                    session.attributeFactory.makeAttribute(
+                                        Pkcs11AttributeType.CKA_CLASS,
+                                        CKO_CERTIFICATE
+                                    ),
+                                )
+                            )
 
-                if (result) {
-                    println("RSA signature is valid")
-                } else {
-                    throw IllegalStateException("RSA signature is invalid")
+                            showUsbDialog("Finding signer certificate", "")
+                            val signerCertificate = allCertificates.first()
+                            val signerCertificateValue = signerCertificate
+                                .getByteArrayAttributeValue(session, CKA_VALUE)
+                                .byteArrayValue
+
+                            val keyPair =
+                                findKeyPairByCertificateValue(session, signerCertificateValue)
+                            showUsbDialog("Data to sign:", DATA_TO_SIGN.toString())
+                            val dataToSign =
+                                session.digestManager.digestAtOnce(DATA_TO_SIGN, digestMechanism)
+
+                            val signature = session.signManager.signAtOnce(
+                                dataToSign,
+                                signMechanism,
+                                keyPair.privateKey
+                            )
+                            showUsbDialog("Signed data:", signature.toString())
+
+                            showUsbDialog("Verifying GOST signature", "")
+                            val result = session.verifyManager.verifyAtOnce(
+                                dataToSign,
+                                signature,
+                                signMechanism,
+                                keyPair.publicKey
+                            )
+
+                            if (result) {
+                                showUsbDialog("GOST signature is valid", "")
+                            } else {
+                                throw IllegalStateException("GOST signature is invalid")
+                            }
+                        } catch (e: Exception) {
+                            showUsbDialog(
+                                "Error",
+                                "An unexpected error occurred while trying to sign: ${e.message}"
+                            )
+                        }
+                    }
+                } catch (e: Pkcs11Exception) {
+                    if (e.message?.contains("CKR_PIN_INCORRECT") == true) {
+                        showUsbDialog("Error", "Invalid password provided.")
+                    } else {
+                        showUsbDialog("Error", "An unexpected error occurred: ${e.message}")
+                        throw e
+                    }
                 }
             }
+        } catch (e: Exception) {
+            println(e)
+        } finally {
+            module.finalizeModule()
         }
     }
 
@@ -226,7 +218,7 @@ class MainActivity : FlutterFragmentActivity() {
         template: List<Pkcs11Attribute>
     ): T {
         val objects = session.objectManager.findObjectsAtOnce(clazz, template)
-        if (objects.size < 1) {
+        if (objects.isEmpty()) {
             throw IllegalStateException("${clazz.simpleName} object not found")
         }
         return objects[0]
