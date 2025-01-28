@@ -9,6 +9,6 @@ class ReaderObserver(private val activity: MainActivity) : RtTransport.PcscReade
     }
 
     override fun onReaderRemoved(reader: RtTransport.PcscReader) {
-        activity.showUsbDialog("Reader removed: ${reader.name}}", "")
+        activity.showUsbDialog("Reader removed: ${reader.name}", "")
     }
 }
